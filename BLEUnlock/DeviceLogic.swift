@@ -16,6 +16,8 @@ struct AggregateDecision: Equatable {
 struct DevicePresence {
     let isPresent: Bool
     let hasBeenClose: Bool
+    // Lost-signal fix: absent because its signal timed out (e.g. AirPods in their case), not because it moved away
+    var isLost = false
 
     var isNear: Bool {
         return isPresent && hasBeenClose
@@ -23,11 +25,23 @@ struct DevicePresence {
 }
 
 // Multi-device: lock wins on conflict so a device leaving always locks when configured to
+// Lost-signal fix: only moving away (RSSI below the lock RSSI for the lock delay) locks; a lost device
+// (signal timeout: turned off, put in its case) never locks, under Any and All alike
 func aggregatePresence(_ devices: [DevicePresence], unlockLogic: DeviceLogic, lockLogic: DeviceLogic) -> AggregateDecision {
     guard !devices.isEmpty else { return AggregateDecision(shouldUnlock: false, shouldLock: false) }
-    let shouldLock = lockLogic == .any ? devices.contains { !$0.isPresent } : !devices.contains { $0.isPresent }
+    // Lost-signal fix: lost devices don't vote on locking at all; with none left voting, nothing locks
+    let lockVoters = devices.filter { !$0.isLost }
+    let shouldLock = lockLogic == .any
+        ? lockVoters.contains { !$0.isPresent }
+        : !lockVoters.isEmpty && !lockVoters.contains { $0.isPresent }
     let wantsUnlock = unlockLogic == .any ? devices.contains { $0.isNear } : devices.allSatisfy { $0.isNear }
     return AggregateDecision(shouldUnlock: wantsUnlock && !shouldLock, shouldLock: shouldLock)
+}
+
+// Review fix: a device already away (moved out of range) keeps that reason when its signal later times out;
+// only a present device losing its signal becomes lost
+func awayReasonOnSignalLoss(isPresent: Bool, currentReason: String, lostReason: String) -> String {
+    return isPresent ? lostReason : currentReason
 }
 
 // Device list: group order in the Device submenu
@@ -92,4 +106,52 @@ func isUnnamedDeviceName(_ name: String) -> Bool {
 func deviceRowTitle(name: String, modelName: String?, detail: String) -> String {
     guard let model = modelName, model != name else { return "\(name) (\(detail))" }
     return "\(name) · \(model) (\(detail))"
+}
+
+// Classic monitoring: identity of a listed/monitored device; BLE by CoreBluetooth UUID, Classic by MAC
+enum DeviceID: Hashable {
+    case le(UUID)
+    case classic(String)
+
+    private static let CLASSIC_PREFIX = "classic:"
+
+    // Classic monitoring: normalized ("04:CC:36:40:74:23"); nil unless six hex octets
+    static func classicID(mac: String) -> DeviceID? {
+        let normalized = mac.replacingOccurrences(of: "-", with: ":").uppercased()
+        guard normalized.range(of: "^([0-9A-F]{2}:){5}[0-9A-F]{2}$", options: .regularExpression) != nil else {
+            return nil
+        }
+        return .classic(normalized)
+    }
+
+    // Classic monitoring: BLE keeps the plain UUID string already stored in prefs (no migration)
+    var prefString: String {
+        switch self {
+        case .le(let uuid): return uuid.uuidString
+        case .classic(let mac): return DeviceID.CLASSIC_PREFIX + mac
+        }
+    }
+
+    init?(prefString: String) {
+        if prefString.hasPrefix(DeviceID.CLASSIC_PREFIX) {
+            guard let id = DeviceID.classicID(mac: String(prefString.dropFirst(DeviceID.CLASSIC_PREFIX.count))) else {
+                return nil
+            }
+            self = id
+        } else if let uuid = UUID(uuidString: prefString) {
+            self = .le(uuid)
+        } else {
+            return nil
+        }
+    }
+
+    var leUUID: UUID? {
+        guard case .le(let uuid) = self else { return nil }
+        return uuid
+    }
+
+    var classicMAC: String? {
+        guard case .classic(let mac) = self else { return nil }
+        return mac
+    }
 }

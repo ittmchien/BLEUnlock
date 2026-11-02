@@ -37,6 +37,21 @@ enum DeviceLogicCheck {
         check(aggregatePresence([unseen, away], unlockLogic: .any, lockLogic: .any) == AggregateDecision(shouldUnlock: false, shouldLock: true), "lock Any, seen device away → lock")
         check(aggregatePresence([unseen, away], unlockLogic: .any, lockLogic: .all) == AggregateDecision(shouldUnlock: false, shouldLock: false), "lock All, unseen counts as present")
 
+        // Lost-signal fix: a lost device (signal timeout, e.g. put in its case) never locks; only moving away does
+        let lost = DevicePresence(isPresent: false, hasBeenClose: true, isLost: true)
+        check(aggregatePresence([near, lost], unlockLogic: .any, lockLogic: .any) == AggregateDecision(shouldUnlock: true, shouldLock: false), "AirPods in case, phone near → no lock")
+        check(aggregatePresence([lost, lost], unlockLogic: .any, lockLogic: .any) == AggregateDecision(shouldUnlock: false, shouldLock: false), "all lost, Any → no lock")
+        check(aggregatePresence([lost], unlockLogic: .all, lockLogic: .any) == AggregateDecision(shouldUnlock: false, shouldLock: false), "sole device lost → no lock")
+        check(aggregatePresence([lost], unlockLogic: .all, lockLogic: .all) == AggregateDecision(shouldUnlock: false, shouldLock: false), "sole device lost, All → no lock")
+        check(aggregatePresence([away, lost], unlockLogic: .any, lockLogic: .any) == AggregateDecision(shouldUnlock: false, shouldLock: true), "one moved away → lock")
+        check(aggregatePresence([away, lost], unlockLogic: .any, lockLogic: .all) == AggregateDecision(shouldUnlock: false, shouldLock: true), "All: one away, rest lost → lock")
+        check(aggregatePresence([near, lost], unlockLogic: .any, lockLogic: .all) == AggregateDecision(shouldUnlock: true, shouldLock: false), "All: one near, one lost → no lock")
+        check(aggregatePresence([unseen, lost], unlockLogic: .any, lockLogic: .any) == AggregateDecision(shouldUnlock: false, shouldLock: false), "unseen + lost → no lock")
+        // Review fix: a device that moved away keeps "away" when its signal later times out (else it would
+        // turn "lost", stop locking and let a nearby device unlock the Mac)
+        check(awayReasonOnSignalLoss(isPresent: false, currentReason: "away", lostReason: "lost") == "away", "away then signal loss stays away")
+        check(awayReasonOnSignalLoss(isPresent: true, currentReason: "away", lostReason: "lost") == "lost", "present then signal loss → lost")
+
         // deviceCategory
         check(deviceCategory(model: "iPhone15,2", name: "🍚🍳") == .iphone, "model iPhone")
         check(deviceCategory(model: "Watch6,1", name: "x") == .watch, "model Watch")
@@ -82,6 +97,18 @@ enum DeviceLogicCheck {
         check(deviceRowTitle(name: "M236 LaserJet", modelName: nil, detail: "-68dBm") == "M236 LaserJet (-68dBm)", "no model")
         // Device list: rows of missing monitored devices use the same title with a status detail
         check(deviceRowTitle(name: "🍚🍳", modelName: "iPhone 14 Pro", detail: "Signal not detected") == "🍚🍳 · iPhone 14 Pro (Signal not detected)", "missing row with model")
+        // Classic monitoring: DeviceID pref round trip, legacy UUID strings, MAC normalization
+        let leUUID = UUID(uuidString: "63B61A13-02BF-0CB1-D5FE-1D440735C645")!
+        check(DeviceID(prefString: "63B61A13-02BF-0CB1-D5FE-1D440735C645") == .le(leUUID), "legacy UUID string → le")
+        check(DeviceID.le(leUUID).prefString == "63B61A13-02BF-0CB1-D5FE-1D440735C645", "le prefString is plain UUID")
+        check(DeviceID.classicID(mac: "04-cc-36-40-74-23") == .classic("04:CC:36:40:74:23"), "MAC normalized")
+        check(DeviceID.classic("04:CC:36:40:74:23").prefString == "classic:04:CC:36:40:74:23", "classic prefString")
+        check(DeviceID(prefString: "classic:04:CC:36:40:74:23") == .classic("04:CC:36:40:74:23"), "classic round trip")
+        check(DeviceID(prefString: "classic:nope") == nil, "bad classic MAC → nil")
+        check(DeviceID(prefString: "garbage") == nil, "garbage → nil")
+        check(DeviceID.classicID(mac: "04:CC:36:40:74") == nil, "short MAC → nil")
+        check(DeviceID.le(leUUID).leUUID == leUUID && DeviceID.le(leUUID).classicMAC == nil, "le accessors")
+        check(DeviceID.classic("04:CC:36:40:74:23").classicMAC == "04:CC:36:40:74:23", "classic accessor")
         print("DeviceLogic checks passed")
     }
 }

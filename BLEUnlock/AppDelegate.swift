@@ -19,9 +19,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     // Multi-device: "Unlock When" / "Lock When" submenus
     let unlockLogicMenu = NSMenu()
     let lockLogicMenu = NSMenu()
-    var deviceDict: [UUID: NSMenuItem] = [:]
+    // Classic monitoring: rows keyed by DeviceID
+    var deviceDict: [DeviceID: NSMenuItem] = [:]
     // Device list: RSSI at first sight fixes a row's order
-    var deviceInsertRSSI: [UUID: Int] = [:]
+    var deviceInsertRSSI: [DeviceID: Int] = [:]
     // Device list: unmonitored rows named only by UUID/MAC, kept in one submenu at the bottom
     let unnamedDevicesMenu = NSMenu()
     let unnamedDevicesItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -91,10 +92,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
             return menuItem.tag >= ble.lockRSSI
         } else if menuItem.menu == unlockLogicMenu || menuItem.menu == lockLogicMenu {
             // Multi-device: Any/All only matters with two or more monitored devices
-            return ble.monitoredUUIDs.count > 1
-        } else if menuItem.action == #selector(selectDevice), let uuid = menuItem.representedObject as? UUID {
+            return ble.monitoredIDs.count > 1
+        } else if menuItem.action == #selector(selectDevice), let id = menuItem.representedObject as? DeviceID {
             // Device list: a row kept after its device left the scan list is only clickable when monitored
-            return ble.devices[uuid] != nil || ble.monitoredUUIDs.contains(uuid)
+            // Classic monitoring: rows carry a DeviceID
+            return ble.devices[id] != nil || ble.monitoredIDs.contains(id)
         }
         return true
     }
@@ -146,11 +148,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
 
     // Device list: monitored first; an unmonitored row whose non-generic name is already shown is hidden,
     // otherwise its name is recorded as shown
-    func placeRow(device: Device, name: String, monitored: Set<UUID>) -> DeviceRowPlacement {
-        if monitored.contains(device.uuid) { return .section(t("group_monitored")) }
+    // Device list: an unmonitored row named like a paired device connected to this Mac joins the monitored
+    // section (generic names excluded, they can't identify one device)
+    // Classic monitoring: monitored set holds DeviceIDs
+    func placeRow(device: Device, name: String, monitored: Set<DeviceID>) -> DeviceRowPlacement {
+        if monitored.contains(device.id) { return .section(t("group_monitored")) }
         if isUnnamedDeviceName(name) { return .unnamed }
-        if !isGenericDeviceName(name) && shownDeviceNames.contains(name) { return .hidden }
+        let isGenericName = isGenericDeviceName(name)
+        if !isGenericName && shownDeviceNames.contains(name) { return .hidden }
         shownDeviceNames.insert(name)
+        if !isGenericName && ble.isPairedDeviceConnected(name: name) { return .section(t("group_monitored")) }
         return .section(t(groupTitleKey(category(device: device, name: name))))
     }
 
@@ -184,7 +191,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         deviceMenu.addItem(unnamedDevicesItem)
     }
 
-    // Device list (Fix #82/#173 successor): "Scanning…" first, then monitored devices, then one section per
+    // Device list (Fix #82/#173 successor): "Scanning…" first, then monitored (and connected) devices, then one section per
     // category. Rows keep their first-sight RSSI order (strongest first); empty sections are hidden;
     // an unmonitored row whose non-generic name is already shown (monitored or stronger) is hidden.
     // Device list: unmonitored UUID/MAC-only rows go to the "Unnamed Devices" submenu at the bottom.
@@ -194,33 +201,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         }
         unnamedDevicesMenu.removeAllItems()
         // Device list: rows kept (not detected) while the menu was open are dropped now
-        let departedUUIDs = deviceDict.keys.filter { ble.devices[$0] == nil }
-        for uuid in departedUUIDs {
-            deviceDict.removeValue(forKey: uuid)
-            deviceInsertRSSI.removeValue(forKey: uuid)
+        // Classic monitoring: rows keyed by DeviceID; prefString breaks RSSI ties
+        let departedIDs = deviceDict.keys.filter { ble.devices[$0] == nil }
+        for id in departedIDs {
+            deviceDict.removeValue(forKey: id)
+            deviceInsertRSSI.removeValue(forKey: id)
         }
-        let monitored = ble.monitoredUUIDs
-        // Review fix: uuidString breaks RSSI ties so the order doesn't follow Dictionary order
-        let rows = deviceDict.compactMap { uuid, item -> (device: Device, item: NSMenuItem, name: String)? in
-            guard let device = ble.devices[uuid] else { return nil }
+        let monitored = ble.monitoredIDs
+        // Review fix: prefString breaks RSSI ties so the order doesn't follow Dictionary order
+        let rows = deviceDict.compactMap { id, item -> (device: Device, item: NSMenuItem, name: String)? in
+            guard let device = ble.devices[id] else { return nil }
             return (device, item, device.description)
         }.sorted {
-            let lhsRSSI = deviceInsertRSSI[$0.device.uuid] ?? $0.device.rssi
-            let rhsRSSI = deviceInsertRSSI[$1.device.uuid] ?? $1.device.rssi
-            return lhsRSSI != rhsRSSI ? lhsRSSI > rhsRSSI : $0.device.uuid.uuidString < $1.device.uuid.uuidString
+            let lhsRSSI = deviceInsertRSSI[$0.device.id] ?? $0.device.rssi
+            let rhsRSSI = deviceInsertRSSI[$1.device.id] ?? $1.device.rssi
+            return lhsRSSI != rhsRSSI ? lhsRSSI > rhsRSSI : $0.device.id.prefString < $1.device.id.prefString
         }
 
-        let monitoredRows = rows.filter { monitored.contains($0.device.uuid) }
-        let deviceNames = saveMonitoredValues(monitoredRows.map { ($0.device.uuid, $0.name) }, forKey: DEVICE_NAMES_KEY)
-        let deviceModels = saveMonitoredValues(monitoredRows.compactMap { row -> (UUID, String)? in
+        let monitoredRows = rows.filter { monitored.contains($0.device.id) }
+        let deviceNames = saveMonitoredValues(monitoredRows.map { ($0.device.id, $0.name) }, forKey: DEVICE_NAMES_KEY)
+        let deviceModels = saveMonitoredValues(monitoredRows.compactMap { row -> (DeviceID, String)? in
             guard let model = row.device.model else { return nil }
-            return (row.device.uuid, model)
+            return (row.device.id, model)
         }, forKey: DEVICE_MODELS_KEY)
         shownDeviceNames = Set(monitoredRows.map { $0.name })
         var itemsBySection: [String: [NSMenuItem]] = [:]
         var unnamedItems: [NSMenuItem] = []
         for row in rows {
-            row.item.state = monitored.contains(row.device.uuid) ? .on : .off
+            row.item.state = monitored.contains(row.device.id) ? .on : .off
             switch placeRow(device: row.device, name: row.name, monitored: monitored) {
             case .section(let title): itemsBySection[title, default: []].append(row.item)
             case .unnamed: unnamedItems.append(row.item)
@@ -230,10 +238,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
 
         // Review fix: monitored devices without a scan row stay listed (checked) so they can be deselected;
         // their names aren't added to shownDeviceNames, so a same-named device under a new UUID stays pickable
-        let scannedUUIDs = Set(rows.compactMap { $0.device.uuid })
-        let missingItems = monitored.subtracting(scannedUUIDs)
-            .sorted { $0.uuidString < $1.uuidString }
-            .map { missingDeviceItem(uuid: $0, name: deviceNames[$0.uuidString], model: deviceModels[$0.uuidString]) }
+        // Classic monitoring: missing rows keyed by DeviceID
+        let scannedIDs = Set(rows.compactMap { $0.device.id })
+        let missingItems = monitored.subtracting(scannedIDs)
+            .sorted { $0.prefString < $1.prefString }
+            .map { missingDeviceItem(id: $0, name: deviceNames[$0.prefString], model: deviceModels[$0.prefString]) }
         let monitoredTitle = t("group_monitored")
         itemsBySection[monitoredTitle, default: []] += missingItems
 
@@ -247,12 +256,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
 
     // Review fix: stores values (names, models) of monitored devices seen in the scan under `key`,
     // drops unmonitored UUIDs, returns the stored values
-    func saveMonitoredValues(_ seenValues: [(UUID, String)], forKey key: String) -> [String: String] {
-        let monitoredStrings = Set(ble.monitoredUUIDs.map { $0.uuidString })
+    // Classic monitoring: values keyed by DeviceID.prefString (plain UUID string for BLE, so stored prefs still load)
+    func saveMonitoredValues(_ seenValues: [(DeviceID, String)], forKey key: String) -> [String: String] {
+        let monitoredStrings = Set(ble.monitoredIDs.map { $0.prefString })
         let stored = prefs.dictionary(forKey: key) as? [String: String] ?? [:]
         var values = stored.filter { monitoredStrings.contains($0.key) }
-        for (uuid, value) in seenValues {
-            values[uuid.uuidString] = value
+        for (id, value) in seenValues {
+            values[id.prefString] = value
         }
         if values != stored {
             prefs.set(values, forKey: key)
@@ -263,11 +273,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     // Review fix: checked row of a monitored device absent from the scan list; rebuilt fresh on every
     // rebuildDeviceMenu, so it never duplicates the real row once the device reappears
     // Device list: stored model keeps the model suffix while the device is missing
-    func missingDeviceItem(uuid: UUID, name: String?, model: String?) -> NSMenuItem {
-        let label = name ?? uuid.uuidString
+    // Classic monitoring: keyed by DeviceID
+    func missingDeviceItem(id: DeviceID, name: String?, model: String?) -> NSMenuItem {
+        let label = name ?? id.prefString
         let title = deviceRowTitle(name: label, modelName: model.map(modelDisplayName), detail: t("not_detected"))
         let item = NSMenuItem(title: title, action: #selector(selectDevice), keyEquivalent: "")
-        item.representedObject = uuid
+        item.representedObject = id
         item.state = .on
         return item
     }
@@ -276,27 +287,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     // appended to the end of its section, so existing rows don't move
     func newDevice(device: Device) {
         // Device list: a monitored device keeps its stored model (category, suffix) until GATT reads one
+        // Classic monitoring: rows keyed by DeviceID
         if device.model == nil, let models = prefs.dictionary(forKey: DEVICE_MODELS_KEY) as? [String: String] {
-            device.model = models[device.uuid.uuidString]
+            device.model = models[device.id.prefString]
         }
         let name = device.description
         let title = menuItemTitle(device: device, name: name)
-        deviceInsertRSSI[device.uuid] = device.rssi
-        // Device list: a kept not-detected row or a missing monitored row of this UUID comes back in place
-        let existingItem = deviceDict[device.uuid]
-            ?? deviceMenu.items.first { $0.representedObject as? UUID == device.uuid }
+        deviceInsertRSSI[device.id] = device.rssi
+        // Device list: a kept not-detected row or a missing monitored row of this device comes back in place
+        let existingItem = deviceDict[device.id]
+            ?? deviceMenu.items.first { $0.representedObject as? DeviceID == device.id }
         if let item = existingItem {
             item.title = title
             item.isEnabled = true
-            deviceDict[device.uuid] = item
+            deviceDict[device.id] = item
             return
         }
         let item = NSMenuItem(title: title, action: #selector(selectDevice), keyEquivalent: "")
-        // Review fix: selectDevice reads the UUID from the item (also used by rows of missing devices)
-        item.representedObject = device.uuid
-        deviceDict[device.uuid] = item
+        // Review fix: selectDevice reads the DeviceID from the item (also used by rows of missing devices)
+        item.representedObject = device.id
+        deviceDict[device.id] = item
         guard isDeviceMenuOpen else { return }
-        switch placeRow(device: device, name: name, monitored: ble.monitoredUUIDs) {
+        switch placeRow(device: device, name: name, monitored: ble.monitoredIDs) {
         case .section(let sectionTitle): appendRow(item, toSection: sectionTitle)
         case .unnamed: appendUnnamedRow(item)
         case .hidden: break
@@ -306,27 +318,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     // Device list: updates only retitle (RSSI, name, model); a name or category change regroups the row
     // on the next opening. Review fix: device.description computed once per update
     func updateDevice(device: Device) {
-        guard let menuItem = deviceDict[device.uuid] else { return }
+        // Classic monitoring: rows keyed by DeviceID
+        guard let menuItem = deviceDict[device.id] else { return }
         menuItem.title = menuItemTitle(device: device, name: device.description)
     }
 
     // Device list: while the menu is open the row stays in place as not detected, disabled unless monitored
     // (deselection); rebuildDeviceMenu drops it on the next opening. BLE removes the Device right after.
     func removeDevice(device: Device) {
-        guard isDeviceMenuOpen, let item = deviceDict[device.uuid] else {
-            deviceDict.removeValue(forKey: device.uuid)
-            deviceInsertRSSI.removeValue(forKey: device.uuid)
+        // Classic monitoring: rows keyed by DeviceID
+        guard isDeviceMenuOpen, let item = deviceDict[device.id] else {
+            deviceDict.removeValue(forKey: device.id)
+            deviceInsertRSSI.removeValue(forKey: device.id)
             return
         }
         item.title = menuItemTitle(device: device, name: device.description, detail: t("not_detected"))
-        item.isEnabled = ble.monitoredUUIDs.contains(device.uuid)
+        item.isEnabled = ble.monitoredIDs.contains(device.id)
     }
 
     func updateRSSI(rssi: Int?, active: Bool) {
         if let r = rssi {
             lastRSSI = r
             // Multi-device: with several devices show how many are detected and the strongest signal
-            let monitoredCount = ble.monitoredUUIDs.count
+            let monitoredCount = ble.monitoredIDs.count
             monitorMenuItem?.title = monitoredCount > 1
                 ? String(format: t("monitor_status_detected"), ble.monitoredDetectedCount(), monitoredCount, r)
                 : String(format:"%ddBm", r) + (active ? " (Active)" : "")
@@ -618,35 +632,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     // Multi-device: a click toggles the device in the monitored set.
-    // Review fix: UUID from representedObject, which rows of missing monitored devices carry too
+    // Review fix: DeviceID from representedObject, which rows of missing monitored devices carry too
+    // Classic monitoring: ids are DeviceIDs (BLE UUID or Classic MAC)
     @objc func selectDevice(item: NSMenuItem) {
-        guard let uuid = item.representedObject as? UUID else { return }
-        monitorDevices(ble.monitoredUUIDs.symmetricDifference([uuid]))
+        guard let id = item.representedObject as? DeviceID else { return }
+        monitorDevices(ble.monitoredIDs.symmetricDifference([id]))
         saveMonitoredDevices()
         rebuildDeviceMenu()
     }
 
     // Multi-device: (re)start monitoring; an empty set shows "Device not selected"
-    func monitorDevices(_ uuids: Set<UUID>) {
+    func monitorDevices(_ ids: Set<DeviceID>) {
         connected = false
         statusItem.button?.image = NSImage(named: "StatusBarDisconnected")
-        monitorMenuItem?.title = t(uuids.isEmpty ? "device_not_set" : "not_detected")
-        ble.startMonitor(uuids: uuids)
+        monitorMenuItem?.title = t(ids.isEmpty ? "device_not_set" : "not_detected")
+        ble.startMonitor(ids: ids)
     }
 
     // Multi-device: persisted as "devices"; the legacy single "device" pref is migrated once
-    func loadMonitoredDevices() -> Set<UUID> {
-        if let uuidStrings = prefs.stringArray(forKey: "devices") {
-            return Set(uuidStrings.compactMap { UUID(uuidString: $0) })
+    // Classic monitoring: entries parse as DeviceID (plain UUID string = BLE, "classic:<MAC>" = Classic)
+    func loadMonitoredDevices() -> Set<DeviceID> {
+        if let idStrings = prefs.stringArray(forKey: "devices") {
+            // Classic withdrawn: macOS reports no live RSSI for Classic links, so stored "classic:" entries are skipped
+            return Set(idStrings.compactMap { DeviceID(prefString: $0) }.filter { $0.leUUID != nil })
         }
         guard let legacy = prefs.string(forKey: "device"), let uuid = UUID(uuidString: legacy) else { return [] }
         prefs.set([uuid.uuidString], forKey: "devices")
         prefs.removeObject(forKey: "device")
-        return [uuid]
+        return [.le(uuid)]
     }
 
     func saveMonitoredDevices() {
-        prefs.set(ble.monitoredUUIDs.map { $0.uuidString }.sorted(), forKey: "devices")
+        prefs.set(ble.monitoredIDs.map { $0.prefString }.sorted(), forKey: "devices")
     }
 
     func errorModal(_ msg: String, info: String? = nil) {

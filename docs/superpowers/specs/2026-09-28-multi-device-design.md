@@ -111,6 +111,10 @@ BLE (`BLE.swift`):
     but not for unlocking (no password typed before a device was really seen).
   - Unlock Any = any present and seen close; Unlock All = all present and seen close.
   - Lock Any = any away; Lock All = all away.
+  - Only "away" (RSSI below the lock RSSI for the lock delay) locks. A device absent through signal timeout
+    ("lost", e.g. turned off, AirPods in their case) never locks: lost devices are left out of both Lock Any
+    and Lock All; with every device lost, nothing locks.
+    A device already away keeps "away" when its signal later times out (never re-labelled "lost").
   - Conflict (both true) → lock wins.
   - Single device → both logics equivalent.
 - Delegate `updatePresence` is called when the aggregate changes, and additionally with `false` whenever a

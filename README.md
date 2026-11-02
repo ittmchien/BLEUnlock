@@ -67,7 +67,7 @@ Lock Screen Now | It locks the screen regardless of whether the BLE device is ne
 Unlock RSSI | Bluetooth signal strength to unlock. Larger value indicates that the BLE device needs to be closer to the Mac to unlock. Choose *Disable* to disable unlocking.
 Lock RSSI | Bluetooth signal strength to lock. Smaller value indicates that the BLE device needs to be farther away from the Mac to lock. Choose *Disable* to disable locking.
 Delay to Lock | Duration of time before it locks the Mac when it detects that the BLE device is away. If the BLE device comes closer within that time, no lock will occur.
-No-Signal Timeout | Time between last signal reception and locking. If you experience frequent "Signal is lost" locking, increase this value.
+No-Signal Timeout | Time between last signal reception and marking the device as lost. A lost device (turned off, put in its case) never locks the Mac; only moving away (below *Lock RSSI*) does.
 Wake on Proximity | Wakes up the display from sleep when the BLE device approaches while locking.
 Wake without Unlocking | BLEUnlock will not unlock the Mac when the display wakes up from sleep, whether automatically via "Wake on Proximity" or manually. This allows for compatibility with the macOS built-in unlock with Apple Watch feature (which can operate immediately after BLEUnlock wakes the screen), or if you just prefer the lock screen to appear more quickly but don't want it to auto-unlock.
 Pause "Now Playing" while Locked | On lock/unlock, BLEUnlock pauses/unpauses playback of music or video (including Apple Music, QuickTime Player and Spotify) that is controlled by *Now Playing* widget or the ⏯ key on the keyboard.
@@ -97,6 +97,7 @@ If it asks for permission to access its own password in Keychain, you must choos
 
 ### "Signal is lost" occurs frequently
 
+A lost signal no longer locks the Mac, but the device shows as not detected.
 Increase *No-Signal Timeout*.
 Or try *Passive Mode*.
 
@@ -144,7 +145,7 @@ An argument is passed depending on the type of event:
 |Event|Argument|
 |-----|--------|
 |Locked by BLEUnlock because of low RSSI|`away`|
-|Locked by BLEUnlock because of no signal|`lost`|
+|Locked by BLEUnlock because of no signal (no longer sent: a lost signal never locks)|`lost`|
 |Unlocked by BLEUnlock|`unlocked`|
 |Unlocked manually|`intruded`|
 

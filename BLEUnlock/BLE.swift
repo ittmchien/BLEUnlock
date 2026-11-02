@@ -35,8 +35,16 @@ func getNameFromMAC(_ mac: String) -> String? {
     return nil
 }
 
+// Classic monitoring: device key of a CoreBluetooth peripheral
+extension CBPeripheral {
+    var deviceID: DeviceID {
+        return .le(identifier)
+    }
+}
+
 class Device: NSObject {
-    let uuid : UUID!
+    // Classic monitoring: BLE UUID or Classic MAC
+    let id: DeviceID
     var peripheral : CBPeripheral?
     var manufacture : String?
     var model : String?
@@ -68,14 +76,17 @@ class Device: NSObject {
 
     override var description: String {
         get {
-            if macAddr == nil || blName == nil {
-                if let info = getLEDeviceInfoFromUUID(uuid.description) {
-                    blName = info.name
-                    macAddr = info.macAddr
+            // Classic monitoring: CoreBluetooth caches are keyed by UUID; Classic devices carry their MAC already
+            if let uuid = id.leUUID {
+                if macAddr == nil || blName == nil {
+                    if let info = getLEDeviceInfoFromUUID(uuid.uuidString) {
+                        blName = info.name
+                        macAddr = info.macAddr
+                    }
                 }
-            }
-            if macAddr == nil {
-                macAddr = getMACFromUUID(uuid.description)
+                if macAddr == nil {
+                    macAddr = getMACFromUUID(uuid.uuidString)
+                }
             }
             if let mac = macAddr {
                 if blName == nil {
@@ -128,12 +139,13 @@ class Device: NSObject {
             if let mac = macAddr {
                 return mac // better than uuid
             }
-            return uuid.description
+            return id.prefString
         }
     }
 
-    init(uuid _uuid: UUID) {
-        uuid = _uuid
+    // Classic monitoring: re-keyed from UUID to DeviceID
+    init(id: DeviceID) {
+        self.id = id
     }
 }
 
@@ -153,7 +165,8 @@ protocol BLEDelegate {
 
 // Multi-device: per-device monitoring state (replaces BLE's former single-device fields)
 final class MonitoredDeviceState {
-    let uuid: UUID
+    // Classic monitoring: keyed by DeviceID
+    let id: DeviceID
     var peripheral: CBPeripheral?
     var presence = true
     // Review fix: set once the device is seen within unlock range; gates unlocking, not locking
@@ -167,8 +180,8 @@ final class MonitoredDeviceState {
     var lastReadAt = 0.0
     var awayReason = "away"
 
-    init(uuid: UUID) {
-        self.uuid = uuid
+    init(id: DeviceID) {
+        self.id = id
     }
 
     func invalidateTimers() {
@@ -189,13 +202,16 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     let CONNECTION_TIMEOUT = 60.0
     let ACTIVE_MODE_READ_INTERVAL = 2.0
     let ACTIVE_MODE_FALLBACK_AFTER = 10.0
+    // Lost-signal fix: away reason of a device whose signal timed out (also passed to the user's script)
+    let LOST_REASON = "lost"
     var centralMgr : CBCentralManager!
-    var devices : [UUID : Device] = [:]
+    // Classic monitoring: keyed by DeviceID (BLE UUID or Classic MAC)
+    var devices: [DeviceID: Device] = [:]
     var delegate: BLEDelegate?
     var scanMode = false
     // Multi-device: state per monitored device; `presence` is the aggregate "unlock allowed" result
-    var monitoredStates: [UUID: MonitoredDeviceState] = [:]
-    var monitoredUUIDs: Set<UUID> {
+    var monitoredStates: [DeviceID: MonitoredDeviceState] = [:]
+    var monitoredIDs: Set<DeviceID> {
         return Set(monitoredStates.keys)
     }
     var unlockLogic: DeviceLogic = .all {
@@ -210,6 +226,13 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     // Device list: paired classic Bluetooth devices, name → major device class, refreshed lazily
     let PAIRED_DEVICES_REFRESH_INTERVAL = 5.0
     var pairedClassByName: [String: UInt32] = [:]
+    // Device list: names of paired devices connected to this Mac, refreshed with pairedClassByName
+    var connectedPairedNames: Set<String> = []
+    // Pairing prompt fix: Apple company ID (little endian) leading the manufacturer data
+    let APPLE_COMPANY_ID: [UInt8] = [0x4C, 0x00]
+    // Pairing prompt fix: prefs key and cap of the UUIDs/names already connected for their info
+    let INFO_TRIED_DEVICES_KEY = "infoTriedDevices"
+    let MAX_INFO_TRIED_DEVICES = 500
     var pairedDevicesReadAt = 0.0
     var lockRSSI = -80
     var unlockRSSI = -60
@@ -265,18 +288,19 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         scanForPeripherals()
     }
 
-    // Multi-device: sync monitored states with `uuids`, keeping states of devices still monitored
-    func startMonitor(uuids: Set<UUID>) {
-        for (uuid, state) in monitoredStates where !uuids.contains(uuid) {
+    // Multi-device: sync monitored states with `ids`, keeping states of devices still monitored
+    // Classic monitoring: ids are DeviceIDs
+    func startMonitor(ids: Set<DeviceID>) {
+        for (id, state) in monitoredStates where !ids.contains(id) {
             state.invalidateTimers()
             if let p = state.peripheral {
                 centralMgr.cancelPeripheralConnection(p)
             }
-            monitoredStates.removeValue(forKey: uuid)
+            monitoredStates.removeValue(forKey: id)
         }
-        for uuid in uuids where monitoredStates[uuid] == nil {
-            let state = MonitoredDeviceState(uuid: uuid)
-            monitoredStates[uuid] = state
+        for id in ids where monitoredStates[id] == nil {
+            let state = MonitoredDeviceState(id: id)
+            monitoredStates[id] = state
             resetSignalTimer(state: state)
         }
         guard !monitoredStates.isEmpty else {
@@ -290,7 +314,11 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     // Review fix: unseen devices hold off locking but never allow unlocking (see DevicePresence)
     func aggregateDecision(_ states: [MonitoredDeviceState]) -> AggregateDecision {
-        let devices = states.map { DevicePresence(isPresent: $0.presence, hasBeenClose: $0.hasBeenClose) }
+        // Lost-signal fix: a device absent through signal timeout is passed as lost (see aggregatePresence)
+        let devices = states.map {
+            DevicePresence(isPresent: $0.presence, hasBeenClose: $0.hasBeenClose,
+                           isLost: !$0.presence && $0.awayReason == LOST_REASON)
+        }
         return aggregatePresence(devices, unlockLogic: unlockLogic, lockLogic: lockLogic)
     }
 
@@ -315,9 +343,12 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         let decision = aggregateDecision(states)
         let isUnlockRisingEdge = decision.shouldUnlock && !wasUnlockAllowed
         wasUnlockAllowed = decision.shouldUnlock
-        if decision.shouldLock && (presence || departed != nil) {
+        // Lost-signal fix: a device going lost is no departure that re-locks, and never names the lock reason
+        let lockingDeparture = departed.flatMap { $0.awayReason == LOST_REASON ? nil : $0 }
+        if decision.shouldLock && (presence || lockingDeparture != nil) {
             presence = false
-            let reason = departed?.awayReason ?? states.first(where: { !$0.presence })?.awayReason ?? "away"
+            let awayState = states.first { !$0.presence && $0.awayReason != LOST_REASON }
+            let reason = lockingDeparture?.awayReason ?? awayState?.awayReason ?? "away"
             delegate?.updatePresence(presence: presence, reason: reason)
         } else if decision.shouldUnlock && (!presence || isUnlockRisingEdge) {
             presence = true
@@ -330,17 +361,29 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     // Device list: major class of the paired classic Bluetooth device with this name, if any.
     // ponytail: matched by name only; two paired devices with one name share the first one's class
     func pairedClassMajor(name: String) -> UInt32? {
-        let now = Date().timeIntervalSince1970
-        if now - pairedDevicesReadAt >= PAIRED_DEVICES_REFRESH_INTERVAL {
-            pairedDevicesReadAt = now
-            let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
-            let entries = paired.compactMap { device -> (String, UInt32)? in
-                guard let pairedName = device.name else { return nil }
-                return (pairedName, device.deviceClassMajor)
-            }
-            pairedClassByName = Dictionary(entries, uniquingKeysWith: { first, _ in first })
-        }
+        refreshPairedDevicesIfStale()
         return pairedClassByName[name]
+    }
+
+    // Device list: true when a paired device with this name is currently connected to this Mac
+    // ponytail: matched by name only, like pairedClassMajor
+    func isPairedDeviceConnected(name: String) -> Bool {
+        refreshPairedDevicesIfStale()
+        return connectedPairedNames.contains(name)
+    }
+
+    // Device list: reads paired devices (class, connection state) at most once per refresh interval
+    func refreshPairedDevicesIfStale() {
+        let now = Date().timeIntervalSince1970
+        guard now - pairedDevicesReadAt >= PAIRED_DEVICES_REFRESH_INTERVAL else { return }
+        pairedDevicesReadAt = now
+        let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
+        let entries = paired.compactMap { device -> (String, UInt32)? in
+            guard let pairedName = device.name else { return nil }
+            return (pairedName, device.deviceClassMajor)
+        }
+        pairedClassByName = Dictionary(entries, uniquingKeysWith: { first, _ in first })
+        connectedPairedNames = Set(paired.filter { $0.isConnected() }.compactMap { $0.name })
     }
 
     // Multi-device: monitored devices currently present with a signal
@@ -350,7 +393,8 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     // Multi-device: find the state of a monitored peripheral, attaching the peripheral on first sight
     func monitoredState(for peripheral: CBPeripheral) -> MonitoredDeviceState? {
-        guard let state = monitoredStates[peripheral.identifier] else { return nil }
+        // Classic monitoring: states are keyed by DeviceID
+        guard let state = monitoredStates[peripheral.deviceID] else { return nil }
         if state.peripheral == nil {
             state.peripheral = peripheral
         }
@@ -370,7 +414,10 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         state.signalTimer = commonModeTimer(signalTimeout, repeats: false) { _ in
             print("Device is lost")
             state.lastRSSI = nil
-            self.markAway(state: state, reason: "lost")
+            // Review fix: an "away" device must not turn "lost" (lost doesn't lock while another device is near)
+            let reason = awayReasonOnSignalLoss(isPresent: state.presence, currentReason: state.awayReason,
+                                                lostReason: self.LOST_REASON)
+            self.markAway(state: state, reason: reason)
         }
     }
 
@@ -450,10 +497,11 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             self.delegate?.removeDevice(device: device)
             // Review fix: a stale scan row must not drop a monitored device's active-mode connection
             // (passive mode holds no connections, so always release there)
-            if let p = device.peripheral, self.monitoredStates[device.uuid] == nil || self.passiveMode {
+            // Classic monitoring: keyed by DeviceID
+            if let p = device.peripheral, self.monitoredStates[device.id] == nil || self.passiveMode {
                 self.centralMgr.cancelPeripheralConnection(p)
             }
-            self.devices.removeValue(forKey: device.uuid)
+            self.devices.removeValue(forKey: device.id)
         })
         if let timer = device.scanTimer {
             RunLoop.main.add(timer, forMode: .common)
@@ -488,12 +536,28 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     // Naming: once every info read has finished or failed, drop the connection of an unmonitored device
     // (absent services/characteristics count as finished, so connections are never held forever)
     func finishInfoReadIfDone(_ peripheral: CBPeripheral) {
-        guard let device = devices[peripheral.identifier], device.pendingInfoReads.isEmpty else { return }
+        // Classic monitoring: keyed by DeviceID
+        guard let device = devices[peripheral.deviceID], device.pendingInfoReads.isEmpty else { return }
         device.hasReadInfo = true
         // Review fix: passive mode keeps no connection to monitored devices either
-        if monitoredStates[peripheral.identifier] == nil || passiveMode {
+        if monitoredStates[peripheral.deviceID] == nil || passiveMode {
             centralMgr.cancelPeripheralConnection(peripheral)
         }
+    }
+
+    // Pairing prompt fix: reading info from some non-Apple devices (e.g. Xiaomi watches) makes macOS show a
+    // "Connection Request" pairing dialog. Apple devices are always read (their model drives grouping);
+    // any other device is connected at most once, remembered across launches by UUID and advertised name
+    // (random-address devices come back under a new UUID with the same name).
+    func shouldConnectForInfo(_ device: Device) -> Bool {
+        if let adv = device.advData, adv.starts(with: APPLE_COMPANY_ID) { return true }
+        // Classic monitoring: key by the pref string of the device id
+        let keys = [device.id.prefString] + [device.advertisedName].compactMap { $0 }.filter { !isGenericDeviceName($0) }
+        let tried = UserDefaults.standard.stringArray(forKey: INFO_TRIED_DEVICES_KEY) ?? []
+        guard Set(tried).isDisjoint(with: keys) else { return false }
+        // ponytail: oldest entries dropped past the cap; a long-forgotten device may prompt once more
+        UserDefaults.standard.set(Array((tried + keys).suffix(MAX_INFO_TRIED_DEVICES)), forKey: INFO_TRIED_DEVICES_KEY)
+        return true
     }
 
     // Naming: keep the last non-blank advertised local name (not every packet carries it)
@@ -529,20 +593,22 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     }
                 }
             }
-            let dev = devices[peripheral.identifier]
+            // Classic monitoring: keyed by DeviceID
+            let dev = devices[peripheral.deviceID]
             var device: Device
             if (dev == nil) {
-                device = Device(uuid: peripheral.identifier)
+                device = Device(id: peripheral.deviceID)
                 storeAdvertisedName(advertisementData, on: device)
                 if (rssi >= thresholdRSSI) {
                     device.peripheral = peripheral
                     device.rssi = rssi
                     device.advData = advertisementData["kCBAdvDataManufacturerData"] as? Data
-                    devices[peripheral.identifier] = device
+                    devices[peripheral.deviceID] = device
                     // Naming: an already connected peripheral (monitored, active mode) gets no new didConnect
+                    // Pairing prompt fix: a non-Apple device is connected for its info only once, ever
                     if peripheral.state == .connected {
                         discoverInfoServices(peripheral)
-                    } else {
+                    } else if shouldConnectForInfo(device) {
                         central.connect(peripheral, options: nil)
                     }
                     delegate?.newDevice(device: device)
@@ -562,7 +628,8 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     {
         peripheral.delegate = self
         // Naming: also read info of a listed device whose read never finished (e.g. connected by active mode)
-        if scanMode || devices[peripheral.identifier]?.hasReadInfo == false {
+        // Classic monitoring: keyed by DeviceID
+        if scanMode || devices[peripheral.deviceID]?.hasReadInfo == false {
             discoverInfoServices(peripheral)
         }
         // Multi-device: match the connected peripheral to its monitored state
@@ -610,7 +677,8 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverServices error: Error?) {
         let services = (peripheral.services ?? []).filter { InfoCharacteristics[$0.uuid] != nil }
-        devices[peripheral.identifier]?.pendingInfoReads = Set(services.map { $0.uuid })
+        // Classic monitoring: keyed by DeviceID
+        devices[peripheral.deviceID]?.pendingInfoReads = Set(services.map { $0.uuid })
         for service in services {
             peripheral.discoverCharacteristics(InfoCharacteristics[service.uuid], for: service)
         }
@@ -624,7 +692,8 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     {
         let wanted = InfoCharacteristics[service.uuid] ?? []
         let chars = (service.characteristics ?? []).filter { wanted.contains($0.uuid) }
-        if let device = devices[peripheral.identifier] {
+        // Classic monitoring: keyed by DeviceID
+        if let device = devices[peripheral.deviceID] {
             device.pendingInfoReads.remove(service.uuid)
             device.pendingInfoReads.formUnion(chars.map { $0.uuid })
         }
@@ -639,7 +708,8 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?)
     {
-        guard let device = devices[peripheral.identifier] else { return }
+        // Classic monitoring: keyed by DeviceID
+        guard let device = devices[peripheral.deviceID] else { return }
         device.pendingInfoReads.remove(characteristic.uuid)
         if error == nil, let value = characteristic.value, let str = String(data: value, encoding: .utf8) {
             switch characteristic.uuid {
